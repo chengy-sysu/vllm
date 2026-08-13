@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     MooncakeStoreScheduler,
 )
+from vllm.v1.core.block_pool import BlockPool
 
 
 def _make_bare_scheduler(
@@ -27,6 +28,12 @@ def _make_bare_scheduler(
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
+    scheduler._gpu_block_pool = BlockPool(
+        num_gpu_blocks=64, enable_caching=True, hash_block_size=hash_block_size
+    )
+    scheduler._num_workers = 1
+    scheduler._next_save_seq = 0
+    scheduler._pinned_saves = {}
     return scheduler
 
 
@@ -713,7 +720,9 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     assert tracker.num_saved_tokens == 0
     assert tracker.has_pending_offload is True
     request = SimpleNamespace(request_id="req-0")
-    assert scheduler.request_finished(request, ([0],)) == (True, None)
+    # The offload-only job holds its own reference on the block it reads, so the
+    # scheduler no longer has to delay the free to keep that block alive.
+    assert scheduler.request_finished(request, ([0],)) == (False, None)
 
 
 def test_resumed_partial_tail_uses_handoff_boundary():

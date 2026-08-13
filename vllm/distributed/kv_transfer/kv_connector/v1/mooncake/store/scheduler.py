@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     LoadSpec,
     MooncakeStoreConnectorMetadata,
+    MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
 )
@@ -24,10 +25,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
     LookupKeyClient,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -77,6 +80,18 @@ class MooncakeStoreScheduler:
         self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
+
+        # Store jobs keep the GPU blocks they read alive by holding a reference
+        # on them, so the allocator cannot hand those blocks to another request
+        # while a put is still in flight.
+        self._gpu_block_pool: BlockPool | None = None
+        self._num_workers = vllm_config.parallel_config.world_size
+        self._next_save_seq = 0
+        # save_seq -> (referenced block ids, ranks yet to report completion)
+        self._pinned_saves: dict[int, tuple[list[int], int]] = {}
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        self._gpu_block_pool = gpu_block_pool
 
     def get_num_new_matched_tokens(
         self,
@@ -392,33 +407,73 @@ class MooncakeStoreScheduler:
                     )
                 )
 
+        self._reference_save_blocks(meta)
         return meta
+
+    def _reference_save_blocks(self, meta: MooncakeStoreConnectorMetadata) -> None:
+        """Take a GPU block reference for every store job this step emits.
+
+        The worker DMAs KV out of these blocks after the step that scheduled
+        them, so the allocator must not reuse them in the meantime. Holding a
+        reference is what makes preemption safe: freeing the request drops the
+        block's count to a still-positive value, keeping it out of the free
+        queue until every rank reports the job done.
+
+        Blocks are referenced per job rather than per request because a request
+        id is reused once the request resumes, while a job is unique for the
+        run.
+        """
+        pool = self._gpu_block_pool
+        for req_meta in meta.requests:
+            if not req_meta.can_save:
+                continue
+            assert pool is not None, (
+                "GPU block pool must be bound before any store job is emitted"
+            )
+            req_meta.save_seq = save_seq = self._next_save_seq
+            self._next_save_seq += 1
+            # Every allocated block is referenced, not just the ones covering
+            # this job's token range. A rank resumes from its own last
+            # successful offset, which lags the scheduler's whenever a save was
+            # skipped or failed, so it may read anywhere below the range; and a
+            # partial-tail offload reads the block holding the tokens just past
+            # it, so it may read one block above.
+            block_ids = [bid for group in req_meta.block_ids for bid in group]
+            if not block_ids:
+                continue
+            self._pinned_saves[save_seq] = (block_ids, self._num_workers)
+            pool.touch([pool.blocks[bid] for bid in block_ids])
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        """Drop the block references of store jobs every rank has finished."""
+        meta = connector_output.kv_connector_worker_meta
+        if not isinstance(meta, MooncakeStoreWorkerMetadata):
+            return
+        pool = self._gpu_block_pool
+        assert pool is not None
+        for save_seq, count in meta.completed_saves.items():
+            pinned = self._pinned_saves.get(save_seq)
+            if pinned is None:
+                # The job referenced no blocks, so nothing was recorded for it.
+                continue
+            block_ids, remaining = pinned
+            remaining -= count
+            if remaining > 0:
+                self._pinned_saves[save_seq] = (block_ids, remaining)
+                continue
+            assert remaining == 0, (
+                f"store job {save_seq} reported by more than {self._num_workers} ranks"
+            )
+            del self._pinned_saves[save_seq]
+            pool.free_blocks([pool.blocks[bid] for bid in block_ids])
 
     def request_finished(
         self,
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Determine whether to delay freeing blocks for async save."""
-        if self.kv_role == "kv_consumer":
-            return False, None
-        tracker = self._request_trackers.get(request.request_id)
-        # Missing tracker can happen when the request is aborted before the
-        # connector observes the normal finished lifecycle or is preempted
-        # before finishing.
-        if tracker is None or (
-            tracker.num_saved_tokens <= 0 and not tracker.has_pending_offload
-        ):
-            return False, None
-        total_blocks = sum(len(g) for g in block_ids)
-        delay_free_blocks = total_blocks > 0
-        if delay_free_blocks:
-            logger.debug(
-                "Delaying free of %d blocks for request %s",
-                total_blocks,
-                request.request_id,
-            )
-        return delay_free_blocks, None
+        """Never delays the free: in-flight saves hold their own block refs."""
+        return False, None
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.
