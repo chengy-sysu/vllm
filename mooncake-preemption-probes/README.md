@@ -76,9 +76,18 @@ only runs when the allocator, not the store, is the bottleneck.
 every save is a real `batch_put`. At `BLOCKS=1024` with 96 requests / 48
 concurrent / 400 words / 192 max tokens it produces 125–288 preemptions per run.
 
-The paths in `load/*.sh` are this cluster's (`/home/felixlinker`,
-`/mnt/nvme/shared/felixlinker`, `bond0`, a local `Qwen3-32B-FP8`) and need
-substituting. `SERVE_EXTRA=--no-enable-flashinfer-autotune` is required, or
+Everything site-specific is an environment variable: `VENV` (default
+`$HOME/.venv`), `MODEL` (`Qwen/Qwen3-32B-FP8`), `FSROOT_BASE`
+(`$HOME/mooncake_fs_ab`), `MOONCAKE_CONFIG_PATH` (`$HOME/mooncake_config.json`),
+`VLLM_REPO` (`$HOME/vllm`, only used to print which commit is under test),
+`LOGDIR`, `BASE` (`http://127.0.0.1:8000`) and `IFACE`, which is the interface
+`VLLM_HOST_IP` is taken from and is left unset by default.
+
+`ab_run.sh` talks to `BASE`, so it has to run on the node that will host the
+server — from a login node the health poll never passes even though the server
+comes up fine.
+
+`SERVE_EXTRA=--no-enable-flashinfer-autotune` is required, or
 `compile_or_warm_up_model` fails with
 `ImportError: cannot import name 'set_autotune_process_group'`.
 

@@ -1,11 +1,12 @@
 #!/bin/bash
-# Mooncake master for the pin A/B. Each run gets its own root_fs_dir so both
-# arms start from a cold store instead of inheriting the previous arm's disk
-# replicas.
+# Mooncake master for one run. TAG picks the root_fs_dir, so changing it is what
+# makes the store cold instead of inheriting the previous run's disk replicas.
 ulimit -l unlimited
-FSROOT=/mnt/nvme/shared/felixlinker/mooncake_fs_ab_${TAG:?TAG required}
+VENV=${VENV:-$HOME/.venv}
+source "$VENV/bin/activate"
+FSROOT=${FSROOT_BASE:-$HOME/mooncake_fs_ab}_${TAG:?TAG required}
 mkdir -p "$FSROOT"
-exec /home/felixlinker/.venv/bin/mooncake_master \
+exec mooncake_master \
   --rpc_port=50051 \
   --metrics_port=19004 \
   --enable_http_metadata_server=true \
