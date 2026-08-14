@@ -83,10 +83,6 @@ Everything site-specific is an environment variable: `VENV` (default
 `LOGDIR`, `BASE` (`http://127.0.0.1:8000`) and `IFACE`, which is the interface
 `VLLM_HOST_IP` is taken from and is left unset by default.
 
-`ab_run.sh` talks to `BASE`, so it has to run on the node that will host the
-server — from a login node the health poll never passes even though the server
-comes up fine.
-
 `SERVE_EXTRA=--no-enable-flashinfer-autotune` is required, or
 `compile_or_warm_up_model` fails with
 `ImportError: cannot import name 'set_autotune_process_group'`.
