@@ -1,0 +1,502 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index ca32c3345..8f1e11e5d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorBase_V1,
+     KVConnectorMetadata,
+     KVConnectorRole,
++    KVConnectorWorkerMetadata,
+     SupportsHMA,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+@@ -37,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+ from vllm.forward_context import ForwardContext
+ from vllm.logger import init_logger
+ from vllm.v1.attention.backend import AttentionMetadata
++from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+@@ -201,6 +203,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+             request, blocks, num_external_tokens
+         )
+ 
++    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
++        assert self.connector_scheduler is not None
++        self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
++
+     def build_connector_meta(
+         self,
+         scheduler_output: SchedulerOutput,
+@@ -208,6 +214,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.build_connector_meta(scheduler_output)
+ 
++    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
++        assert self.connector_worker is not None
++        return self.connector_worker.build_connector_worker_meta()
++
+     def request_finished(
+         self,
+         request: Request,
+@@ -241,6 +251,9 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         return None
+ 
+     def update_connector_output(self, connector_output: KVConnectorOutput):
++        assert self.connector_scheduler is not None
++        self.connector_scheduler.update_connector_output(connector_output)
++
+         kv_cache_events = connector_output.kv_cache_events
+         if not kv_cache_events or not isinstance(
+             kv_cache_events, MooncakeStoreKVEvents
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+index 6daa1e82e..f63841311 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -6,7 +6,7 @@
+ """Data classes for MooncakeStoreConnector."""
+ 
+ from collections.abc import Iterable, Sequence
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import cast
+ 
+ import numpy as np
+@@ -14,6 +14,7 @@ import torch
+ 
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorMetadata,
++    KVConnectorWorkerMetadata,
+ )
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+@@ -366,6 +367,11 @@ class ReqMeta:
+ 
+     token_ids: list[int] | None = None
+     num_prompt_tokens: int | None = None
++    # Identifies this store job for the whole engine run. The scheduler holds a
++    # GPU block reference for the job and only drops it once every rank has
++    # echoed this id back, so it must not be a request id: those are reused
++    # after preemption and would release the wrong job's blocks.
++    save_seq: int | None = None
+     # Core-provided per-mamba-group
+     # (group_id, cow_block_id, boundary_tokens) for this request's partial tail.
+     # Present only on the producer's CoW step; drives the connector's offload
+@@ -434,6 +440,28 @@ class ReqMeta:
+         )
+ 
+ 
++@dataclass
++class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
++    """Store jobs each rank finished, reported back to the scheduler.
++
++    Maps ``ReqMeta.save_seq`` to the number of ranks that are done with it. The
++    scheduler releases a job's GPU block references once the count reaches the
++    world size.
++    """
++
++    completed_saves: dict[int, int] = field(default_factory=dict)
++
++    def aggregate(
++        self, other: "KVConnectorWorkerMetadata"
++    ) -> "MooncakeStoreWorkerMetadata":
++        assert isinstance(other, MooncakeStoreWorkerMetadata)
++        for save_seq, count in other.completed_saves.items():
++            self.completed_saves[save_seq] = (
++                self.completed_saves.get(save_seq, 0) + count
++            )
++        return self
++
++
+ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
+     """Metadata passed from scheduler to worker."""
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 42c6f3fa9..0e3ebff98 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -5,6 +5,7 @@
+ # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
+ """Scheduler-side logic for MooncakeStoreConnector."""
+ 
++import time
+ from typing import Any
+ 
+ from vllm.config import VllmConfig
+@@ -23,11 +24,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
+     LookupKeyClient,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
++    MooncakeStoreWorkerMetadata,
++)
+ from vllm.logger import init_logger
++from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+ from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+ from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.outputs import KVConnectorOutput
+ from vllm.v1.request import Request
+ 
+ logger = init_logger(__name__)
+@@ -78,6 +84,125 @@ class MooncakeStoreScheduler:
+         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
+         self._unfinished_request_ids: set[str] = set()
+ 
++        # --- race detector (instrumentation only, no behavior change) ---
++        self._obs_pool: BlockPool | None = None
++        self._obs_num_workers = vllm_config.parallel_config.world_size
++        self._obs_next_save_seq = 0
++        # save_seq -> (blocks snapshotted at emit, ranks still reading)
++        self._obs_jobs: dict[int, tuple[list[tuple[int, Any]], int]] = {}
++        self._obs_stats = {
++            "jobs": 0,
++            "blocks": 0,
++            "inflight_rehashed": 0,
++            "inflight_jobs_hit": 0,
++            "hit_no_rank_done": 0,
++            "late_rehashed": 0,
++        }
++        self._obs_hit_jobs: set[int] = set()
++        self._obs_log_tick = 0
++
++    def bind_gpu_block_pool(self, block_pool: BlockPool) -> None:
++        self._obs_pool = block_pool
++
++    def _obs_emit(self, meta: MooncakeStoreConnectorMetadata) -> None:
++        """Snapshot the identity of every block a store job is about to read.
++
++        Purely observational: no reference is taken, so the scheduler frees
++        these blocks exactly as it does on the unpatched baseline.
++        """
++        pool = getattr(self, "_obs_pool", None)
++        if pool is None:
++            return
++        for req_meta in meta.requests:
++            if not req_meta.can_save:
++                continue
++            req_meta.save_seq = save_seq = self._obs_next_save_seq
++            self._obs_next_save_seq += 1
++            snapshot = []
++            for group in req_meta.block_ids:
++                for bid in group:
++                    block = pool.blocks[bid]
++                    # A block whose hash is still None is legitimately allowed
++                    # to gain one later (tail block being filled), so it carries
++                    # no signal.
++                    if block.block_hash is not None:
++                        snapshot.append((bid, block.block_hash))
++            if snapshot:
++                self._obs_jobs[save_seq] = (snapshot, self._obs_num_workers)
++                self._obs_stats["jobs"] += 1
++                self._obs_stats["blocks"] += len(snapshot)
++
++    def _obs_scan_inflight(self) -> None:
++        """Catch overwrites while at least one rank is still reading.
++
++        Run every step, before this step's completion reports are consumed, so a
++        hit is provably inside the window where a store still holds the blocks
++        rather than in the gap between the read finishing and the report landing.
++        """
++        pool = getattr(self, "_obs_pool", None)
++        if pool is None or not self._obs_jobs:
++            return
++        stats = self._obs_stats
++        for save_seq, (snapshot, remaining) in list(self._obs_jobs.items()):
++            kept = []
++            hit = []
++            for entry in snapshot:
++                bid, hash_at_emit = entry
++                if pool.blocks[bid].block_hash == hash_at_emit:
++                    kept.append(entry)
++                else:
++                    hit.append(bid)
++            if not hit:
++                continue
++            # Dropped from tracking so one overwritten block is counted once.
++            self._obs_jobs[save_seq] = (kept, remaining)
++            stats["inflight_rehashed"] += len(hit)
++            if remaining == self._obs_num_workers:
++                # Not a single rank has reported finishing, so the read is
++                # unambiguously still outstanding.
++                stats["hit_no_rank_done"] += len(hit)
++            if save_seq not in self._obs_hit_jobs:
++                self._obs_hit_jobs.add(save_seq)
++                stats["inflight_jobs_hit"] += 1
++                logger.warning(
++                    "RACE seq=%d tow=%.6f blocks=%d ranks_busy=%d/%d ids=%s",
++                    save_seq,
++                    time.time(),
++                    len(hit),
++                    remaining,
++                    self._obs_num_workers,
++                    hit[:8],
++                )
++
++    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
++        """Check, once every rank is done reading, whether the blocks moved."""
++        meta = connector_output.kv_connector_worker_meta
++        if not isinstance(meta, MooncakeStoreWorkerMetadata):
++            return
++        pool = self._obs_pool
++        assert pool is not None
++        stats = self._obs_stats
++        for save_seq, count in meta.completed_saves.items():
++            job = self._obs_jobs.get(save_seq)
++            if job is None:
++                continue
++            snapshot, remaining = job
++            remaining -= count
++            if remaining > 0:
++                self._obs_jobs[save_seq] = (snapshot, remaining)
++                continue
++            del self._obs_jobs[save_seq]
++            self._obs_hit_jobs.discard(save_seq)
++            # Anything still matching above was overwritten no earlier than the
++            # last scan, so it may equally have been overwritten after the read
++            # ended. Kept apart from the in-flight count for that reason.
++            stats["late_rehashed"] += sum(
++                1 for bid, h in snapshot if pool.blocks[bid].block_hash != h
++            )
++        self._obs_log_tick += 1
++        if self._obs_log_tick % 500 == 0:
++            logger.info("RACE stats: %s inflight=%d", stats, len(self._obs_jobs))
++
+     def get_num_new_matched_tokens(
+         self,
+         request: Request,
+@@ -172,6 +297,7 @@ class MooncakeStoreScheduler:
+         self, scheduler_output: SchedulerOutput
+     ) -> KVConnectorMetadata:
+         """Build connector metadata for this scheduler step."""
++        self._obs_scan_inflight()
+         force_skip_save = self.kv_role == "kv_consumer"
+ 
+         for finished_req_id in scheduler_output.finished_req_ids:
+@@ -392,6 +518,7 @@ class MooncakeStoreScheduler:
+                     )
+                 )
+ 
++        self._obs_emit(meta)
+         return meta
+ 
+     def request_finished(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 762e5eba9..7ed5303e1 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -46,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+     ChunkedTokenDatabase,
+     KeyMetadata,
+     MooncakeStoreConnectorMetadata,
++    MooncakeStoreWorkerMetadata,
+     PoolKey,
+     ReqMeta,
+ )
+@@ -232,6 +233,24 @@ def _estimate_disk_offload_staging_bytes(size_list: list[int]) -> int:
+     return _align_up(data_size, _DIRECT_IO_ALIGNMENT) + _DIRECT_IO_PADDING_BYTES
+ 
+ 
++_DET_SAMPLES = 8
++_DET_WEIGHTS = torch.tensor([1, 3, 7, 13, 31, 61, 127, 251], dtype=torch.int64)
++
++
++def _kdig(keys: list[str], digests: list[int] | None) -> str:
++    """`hash:fingerprint` pairs, matched up offline across put and get."""
++    if digests is None:
++        return ""
++    # The full key, since tp_rank and group live in the prefix and each rank
++    # holds different heads for the same tokens.
++    return ",".join(f"{k}:{d}" for k, d in zip(keys, digests, strict=True))
++
++
++def _kshort(keys: list[str]) -> str:
++    """Compact key list for the race log; the tail carries the block hash."""
++    return ",".join(k.rsplit("@", 1)[-1][:20] for k in keys)
++
++
+ def _sum_batch_bytes(sizes: list[list[int]]) -> int:
+     return sum(sum(size) for size in sizes)
+ 
+@@ -442,6 +461,42 @@ class KVTransferThread(threading.Thread):
+     def _handle_request(self, req_meta: Any):
+         pass
+ 
++    def _det_write(self, line: str) -> None:
++        """Per-process file, because these lines are far too long to survive the
++        interleaving of two ranks' stdout."""
++        f = getattr(self, "_det_f", None)
++        if f is None:
++            f = open(f"/tmp/det_{os.getpid()}.log", "a", buffering=1 << 20)
++            self._det_f = f
++        f.write(line + "\n")
++
++    def _det_digest(
++        self, addrs: list[list[int]], sizes: list[list[int]]
++    ) -> list[int] | None:
++        """Byte fingerprint of the KV each key covers, sampled from the GPU.
++
++        Taken from the same storage the transfer reads/writes, so a fingerprint
++        recorded before a put and one recorded after the matching get describe
++        the same key. They can only differ if the bytes changed between the two,
++        which for a key naming a fixed token range means the store no longer
++        holds that key's KV.
++        """
++        regions = getattr(self, "_det_regions", None)
++        if not regions:
++            return None
++        base, region_len, flat = regions[0]
++        positions: list[int] = []
++        for addr_group, size_group in zip(addrs, sizes, strict=True):
++            addr, size = addr_group[0], size_group[0]
++            off = addr - base
++            if off < 0 or off + size > region_len:
++                return None
++            step = max(1, size // _DET_SAMPLES)
++            positions.extend(off + j * step for j in range(_DET_SAMPLES))
++        idx = torch.tensor(positions, dtype=torch.long, device=flat.device)
++        vals = flat.index_select(0, idx).view(-1, _DET_SAMPLES).to(torch.int64)
++        return (vals * _DET_WEIGHTS.to(vals.device)).sum(dim=1).cpu().tolist()
++
+     def _record_operation(
+         self,
+         operation: str,
+@@ -507,6 +562,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
+         self.coord = coord
+         self.kv_role = kv_role
+         self.stored_requests: defaultdict[str, int] = defaultdict(int)
++        # save_seq -> times this rank finished with it, drained every step so the
++        # scheduler knows when a job stopped reading the blocks it was given.
++        self._completed_saves: dict[int, int] = {}
+         self.enable_kv_event = enable_kv_event
+         # Caller always passes a non-None ReplicateConfig — see
+         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
+@@ -538,6 +596,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
+             self._skip_store_requests.discard(req_id)
+             self._saved_offset.pop(req_id, None)
+ 
++    def record_save_completed(self, req_meta: ReqMeta) -> None:
++        """Report that this rank stopped reading the job's GPU blocks."""
++        save_seq = req_meta.save_seq
++        if save_seq is None:
++            return
++        with self.done_task_lock:
++            self._completed_saves[save_seq] = self._completed_saves.get(save_seq, 0) + 1
++
++    def take_completed_saves(self) -> dict[int, int]:
++        with self.done_task_lock:
++            completed = self._completed_saves
++            self._completed_saves = {}
++        return completed
++
+     def _record_saved(self, req_id: str, token_len: int) -> None:
+         # Guard on liveness so a concurrent finish/preempt pop isn't recreated.
+         with self.done_task_lock:
+@@ -747,6 +819,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+         current_event = req_meta.current_event
+ 
+         if req_id not in self.stored_requests:
++            self.record_save_completed(req_meta)
+             self.request_queue.task_done()
+             return
+ 
+@@ -922,7 +995,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 self.replicate_config.group_ids = group_ids
+ 
+             batch_bytes = _sum_batch_bytes(sizes)
++            # Snapshot before the transfer, while the blocks still hold the KV
++            # these keys name.
++            det_pre = self._det_digest(addrs, sizes)
+             put_start = time.perf_counter()
++            put_wall = time.time()
+             try:
+                 res = self.store.batch_put_from_multi_buffers(
+                     keys,
+@@ -931,6 +1008,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                     self.replicate_config,
+                 )
+                 failed = [i for i, v in enumerate(res) if v < 0]
++                ok_idx = [i for i, v in enumerate(res) if v >= 0]
++                self._det_write(
++                    f"PUTLOG seq={req_meta.save_seq} t0={put_wall:.6f} "
++                    f"t1={time.time():.6f} n={len(keys)} nfail={len(failed)} "
++                    f"k={_kdig([keys[i] for i in ok_idx], [det_pre[i] for i in ok_idx] if det_pre else None)}"
++                )
+                 self._record_operation(
+                     "save_put",
+                     put_start,
+@@ -985,6 +1068,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 self.update_kv_event(stored_events)
+         finally:
+             self.dec_stored_request(req_id)
++            self.record_save_completed(req_meta)
+             self.request_queue.task_done()
+ 
+ 
+@@ -1140,6 +1224,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                 res = self.store.batch_get_into_multi_buffers(
+                     batch_keys, batch_addrs, batch_sizes
+                 )
++                det_post = self._det_digest(batch_addrs, batch_sizes)
++                ok_idx = [i for i, v in enumerate(res) if v >= 0]
++                self._det_write(
++                    f"GETLOG req={req_id} t={time.time():.6f} n={len(batch_keys)} "
++                    f"k={_kdig([batch_keys[i] for i in ok_idx], [det_post[i] for i in ok_idx] if det_post else None)}"
++                )
+                 if tiers_by_key is not None:
+                     _log_mooncake_load_tier_summary(
+                         req_id, batch_keys, res, tiers_by_key
+@@ -1523,6 +1613,7 @@ class MooncakeStoreWorker:
+         seen_ptrs: set[int] = set()
+         addrs: list[int] = []
+         block_lens: list[int] = []
++        det_regions: list[tuple[int, int, torch.Tensor]] = []
+ 
+         for value in kv_caches.values():
+             cache = _repr_tensor(value)
+@@ -1533,6 +1624,12 @@ class MooncakeStoreWorker:
+             seen_ptrs.add(base_addr)
+             region_len = cache_storage.nbytes()
+ 
++            # Flat byte view over the same storage, so a transfer address can be
++            # turned back into an index and sampled.
++            flat = torch.empty(0, dtype=torch.uint8, device=cache.device)
++            flat.set_(cache_storage, 0, (region_len,))
++            det_regions.append((base_addr, region_len, flat))
++
+             ret = self.store.register_buffer(base_addr, region_len)
+             if ret != 0:
+                 logger.error(
+@@ -1591,6 +1688,7 @@ class MooncakeStoreWorker:
+                 supports_group_ids=self._supports_group_ids,
+                 record_operation=self._record_kv_connector_operation,
+             )
++            self.kv_send_thread._det_regions = det_regions
+             self.kv_send_thread.start()
+ 
+         self.kv_recv_threads = []
+@@ -1609,6 +1707,7 @@ class MooncakeStoreWorker:
+                 request_queue=self.recv_request_queue,
+             )
+             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
++            recv_thread._det_regions = det_regions
+             recv_thread.start()
+             self.kv_recv_threads.append(recv_thread)
+             ready_events_recving.append(ready_event_recving)
+@@ -1757,6 +1856,14 @@ class MooncakeStoreWorker:
+ 
+         return finished_sending
+ 
++    def build_connector_worker_meta(self) -> MooncakeStoreWorkerMetadata | None:
++        if self.kv_send_thread is None:
++            return None
++        completed_saves = self.kv_send_thread.take_completed_saves()
++        if not completed_saves:
++            return None
++        return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
++
+     def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
+         """Check how many prefix tokens exist in the store.
+ 

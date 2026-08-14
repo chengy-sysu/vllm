@@ -1,0 +1,162 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 51c95ec01..db43d04a5 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -233,6 +233,24 @@ def _estimate_disk_offload_staging_bytes(size_list: list[int]) -> int:
+     return _align_up(data_size, _DIRECT_IO_ALIGNMENT) + _DIRECT_IO_PADDING_BYTES
+ 
+ 
++_DET_SAMPLES = 8
++_DET_WEIGHTS = torch.tensor([1, 3, 7, 13, 31, 61, 127, 251], dtype=torch.int64)
++
++
++def _kdig(keys: list[str], digests: list[int] | None) -> str:
++    """`hash:fingerprint` pairs, matched up offline across put and get."""
++    if digests is None:
++        return ""
++    # The full key, since tp_rank and group live in the prefix and each rank
++    # holds different heads for the same tokens.
++    return ",".join(f"{k}:{d}" for k, d in zip(keys, digests, strict=True))
++
++
++def _kshort(keys: list[str]) -> str:
++    """Compact key list for the race log; the tail carries the block hash."""
++    return ",".join(k.rsplit("@", 1)[-1][:20] for k in keys)
++
++
+ def _sum_batch_bytes(sizes: list[list[int]]) -> int:
+     return sum(sum(size) for size in sizes)
+ 
+@@ -443,6 +461,42 @@ class KVTransferThread(threading.Thread):
+     def _handle_request(self, req_meta: Any):
+         pass
+ 
++    def _det_write(self, line: str) -> None:
++        """Per-process file, because these lines are far too long to survive the
++        interleaving of two ranks' stdout."""
++        f = getattr(self, "_det_f", None)
++        if f is None:
++            f = open(f"/tmp/det_{os.getpid()}.log", "a", buffering=1 << 20)
++            self._det_f = f
++        f.write(line + "\n")
++
++    def _det_digest(
++        self, addrs: list[list[int]], sizes: list[list[int]]
++    ) -> list[int] | None:
++        """Byte fingerprint of the KV each key covers, sampled from the GPU.
++
++        Taken from the same storage the transfer reads/writes, so a fingerprint
++        recorded before a put and one recorded after the matching get describe
++        the same key. They can only differ if the bytes changed between the two,
++        which for a key naming a fixed token range means the store no longer
++        holds that key's KV.
++        """
++        regions = getattr(self, "_det_regions", None)
++        if not regions:
++            return None
++        base, region_len, flat = regions[0]
++        positions: list[int] = []
++        for addr_group, size_group in zip(addrs, sizes, strict=True):
++            addr, size = addr_group[0], size_group[0]
++            off = addr - base
++            if off < 0 or off + size > region_len:
++                return None
++            step = max(1, size // _DET_SAMPLES)
++            positions.extend(off + j * step for j in range(_DET_SAMPLES))
++        idx = torch.tensor(positions, dtype=torch.long, device=flat.device)
++        vals = flat.index_select(0, idx).view(-1, _DET_SAMPLES).to(torch.int64)
++        return (vals * _DET_WEIGHTS.to(vals.device)).sum(dim=1).cpu().tolist()
++
+     def _record_operation(
+         self,
+         operation: str,
+@@ -945,7 +999,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 self.replicate_config.group_ids = group_ids
+ 
+             batch_bytes = _sum_batch_bytes(sizes)
++            # Snapshot before the transfer, while the blocks still hold the KV
++            # these keys name.
++            det_pre = self._det_digest(addrs, sizes)
+             put_start = time.perf_counter()
++            put_wall = time.time()
+             try:
+                 res = self.store.batch_put_from_multi_buffers(
+                     keys,
+@@ -954,6 +1012,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                     self.replicate_config,
+                 )
+                 failed = [i for i, v in enumerate(res) if v < 0]
++                ok_idx = [i for i, v in enumerate(res) if v >= 0]
++                self._det_write(
++                    f"PUTLOG seq={req_meta.save_seq} t0={put_wall:.6f} "
++                    f"t1={time.time():.6f} n={len(keys)} nfail={len(failed)} "
++                    f"k={_kdig([keys[i] for i in ok_idx], [det_pre[i] for i in ok_idx] if det_pre else None)}"
++                )
+                 self._record_operation(
+                     "save_put",
+                     put_start,
+@@ -1164,6 +1228,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                 res = self.store.batch_get_into_multi_buffers(
+                     batch_keys, batch_addrs, batch_sizes
+                 )
++                det_post = self._det_digest(batch_addrs, batch_sizes)
++                ok_idx = [i for i, v in enumerate(res) if v >= 0]
++                self._det_write(
++                    f"GETLOG req={req_id} t={time.time():.6f} n={len(batch_keys)} "
++                    f"k={_kdig([batch_keys[i] for i in ok_idx], [det_post[i] for i in ok_idx] if det_post else None)}"
++                )
+                 if tiers_by_key is not None:
+                     _log_mooncake_load_tier_summary(
+                         req_id, batch_keys, res, tiers_by_key
+@@ -1547,6 +1617,7 @@ class MooncakeStoreWorker:
+         seen_ptrs: set[int] = set()
+         addrs: list[int] = []
+         block_lens: list[int] = []
++        det_regions: list[tuple[int, int, torch.Tensor]] = []
+ 
+         for value in kv_caches.values():
+             cache = _repr_tensor(value)
+@@ -1557,6 +1628,12 @@ class MooncakeStoreWorker:
+             seen_ptrs.add(base_addr)
+             region_len = cache_storage.nbytes()
+ 
++            # Flat byte view over the same storage, so a transfer address can be
++            # turned back into an index and sampled.
++            flat = torch.empty(0, dtype=torch.uint8, device=cache.device)
++            flat.set_(cache_storage, 0, (region_len,))
++            det_regions.append((base_addr, region_len, flat))
++
+             ret = self.store.register_buffer(base_addr, region_len)
+             if ret != 0:
+                 logger.error(
+@@ -1615,6 +1692,7 @@ class MooncakeStoreWorker:
+                 supports_group_ids=self._supports_group_ids,
+                 record_operation=self._record_kv_connector_operation,
+             )
++            self.kv_send_thread._det_regions = det_regions
+             self.kv_send_thread.start()
+ 
+         self.kv_recv_threads = []
+@@ -1633,6 +1711,7 @@ class MooncakeStoreWorker:
+                 request_queue=self.recv_request_queue,
+             )
+             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
++            recv_thread._det_regions = det_regions
+             recv_thread.start()
+             self.kv_recv_threads.append(recv_thread)
+             ready_events_recving.append(ready_event_recving)
+@@ -1793,6 +1872,14 @@ class MooncakeStoreWorker:
+             return None
+         return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
+ 
++    def build_connector_worker_meta(self) -> MooncakeStoreWorkerMetadata | None:
++        if self.kv_send_thread is None:
++            return None
++        completed_saves = self.kv_send_thread.take_completed_saves()
++        if not completed_saves:
++            return None
++        return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
++
+     def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
+         """Check how many prefix tokens exist in the store.
+ 

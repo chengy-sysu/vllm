@@ -1,0 +1,221 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -84,6 +84,12 @@
+ DEFAULT_TENANT_ID = "default"
+ 
+ MOONCAKE_NO_AVAILABLE_HANDLE = -200
++
++# REF probe: seconds to stall every store job, used to widen the ABA window on
++# purpose. A queued job only becomes a dangerous orphan if it is still waiting
++# when its preempted request resumes and registers a new save, and a real PUT is
++# far too quick for that to happen on its own.
++_ABA_DELAY = float(os.environ.get("MC_ABA_DELAY") or 0)
+ _T = TypeVar("_T")
+ 
+ 
+@@ -525,7 +531,130 @@
+         # Per-request high-water mark of tokens actually persisted; the next
+         # batch resumes here, so pressure-skipped or failed ranges are retried.
+         self._saved_offset: dict[str, int] = {}
++
++        # --- REF probe (issue #51637, baseline arm) ---------------------------
++        # `stored_requests` here is the bare counter under test. Keep a separate
++        # save_seq-keyed ledger as ground truth for which generation a job
++        # belongs to, so the counter's mistakes can be named as they happen.
++        self._rf_live: dict[str, set[int]] = {}
++        self._rf_ever: set[str] = set()
++        self._rf_retired_seqs: set[int] = set()
++        self._rf_orphan_seqs: set[int] = set()
++        self._rf_orphans: dict[str, int] = {}
++        self._rf_running: set[int] = set()
++        self._rf_retire_running = 0
++        self._rf_retire_queued = 0
++        self._rf_jobs = 0
++        self._rf_retire_pending = 0
++        self._rf_retrack = 0
++        self._rf_armed = 0
++        self._rf_orphan_ran = 0
++        self._rf_mischarge = 0
++        self._rf_underflow = 0
++        self._rf_zero_with_live = 0
++        self._rf_would_skip = 0
++        self._rf_stuck_neg: set[str] = set()
++        self._rf_stuck_final: set[str] = set()
++
++    def add_request(self, request: ReqMeta) -> None:
++        assert request.save_seq is not None
++        with self.done_task_lock:
++            if request.req_id not in self._rf_live:
++                orphans = self._rf_orphans.get(request.req_id, 0)
++                if orphans:
++                    self._rf_armed += 1
++                    logger.error("REF armed req=%s orphans=%d total=%d",
++                                 request.req_id, orphans, self._rf_armed)
++                elif request.req_id in self._rf_ever:
++                    self._rf_retrack += 1
++            self._rf_ever.add(request.req_id)
++            self._rf_live.setdefault(request.req_id, set()).add(request.save_seq)
++        super().add_request(request)
+ 
++    def _rf_discard(self, req_meta: ReqMeta) -> None:
++        with self.done_task_lock:
++            self._rf_running.discard(req_meta.save_seq)
++            live = self._rf_live.get(req_meta.req_id)
++            if live is not None:
++                live.discard(req_meta.save_seq)
++
++    def _rf_job_ran(self, req_meta: ReqMeta) -> None:
++        """Judge one job against the bare counter, at the old gate's decision."""
++        req_id = req_meta.req_id
++        with self.done_task_lock:
++            self._rf_jobs += 1
++            self._rf_running.add(req_meta.save_seq)
++            live = self._rf_live.get(req_id) or set()
++            stale = req_meta.save_seq not in live
++            gate_pass = req_id in self.stored_requests
++            if req_meta.save_seq in self._rf_orphan_seqs:
++                self._rf_orphan_ran += 1
++                logger.error(
++                    "REF orphan-ran req=%s seq=%s stale=%s gate_pass=%s "
++                    "counter=%s live=%s total=%d",
++                    req_id, req_meta.save_seq, stale, gate_pass,
++                    self.stored_requests.get(req_id), sorted(live),
++                    self._rf_orphan_ran)
++            if stale and self._rf_orphans.get(req_id):
++                self._rf_orphans[req_id] -= 1
++            if not gate_pass:
++                if not stale:
++                    self._rf_would_skip += 1
++                    logger.error("REF would-skip-save req=%s seq=%s total=%d",
++                                 req_id, req_meta.save_seq, self._rf_would_skip)
++                return
++            # The gate passed, so this job's `finally` will decrement the counter.
++            if stale:
++                self._rf_mischarge += 1
++                logger.error(
++                    "REF mischarge req=%s stale_seq=%s counter=%d live=%s total=%d",
++                    req_id, req_meta.save_seq, self.stored_requests[req_id],
++                    sorted(live), self._rf_mischarge)
++            others = live - {req_meta.save_seq}
++            if self.stored_requests[req_id] - 1 <= 0 and others:
++                self._rf_zero_with_live += 1
++                logger.error(
++                    "REF zero-with-live req=%s counter_after=%d still_live=%s total=%d",
++                    req_id, self.stored_requests[req_id] - 1, sorted(others),
++                    self._rf_zero_with_live)
++
++    def scan_stuck(self, finished_store_req: set[str]) -> None:
++        """A counter that went negative can never satisfy the `== 0` retirement
++        judge again; once the request has finished too, nothing will bump it back
++        up and the entry is stuck for the rest of the run."""
++        with self.done_task_lock:
++            for req_id, count in self.stored_requests.items():
++                if count >= 0:
++                    continue
++                if req_id not in self._rf_stuck_neg:
++                    self._rf_stuck_neg.add(req_id)
++                    logger.error("REF stuck-negative req=%s counter=%d total=%d",
++                                 req_id, count, len(self._rf_stuck_neg))
++                if req_id in finished_store_req and req_id not in self._rf_stuck_final:
++                    self._rf_stuck_final.add(req_id)
++                    logger.error("REF stuck-forever req=%s counter=%d total=%d",
++                                 req_id, count, len(self._rf_stuck_final))
++
++    def ref_summary(self) -> str:
++        with self.done_task_lock:
++            return (
++                f"REF SUMMARY jobs={self._rf_jobs} "
++                f"retire_with_pending={self._rf_retire_pending} "
++                f"retire_running={self._rf_retire_running} "
++                f"retire_queued={self._rf_retire_queued} "
++                f"delay={_ABA_DELAY} "
++                f"retrack={self._rf_retrack} armed={self._rf_armed} "
++                f"orphan_ran={self._rf_orphan_ran} "
++                f"mischarge={self._rf_mischarge} "
++                f"underflow={self._rf_underflow} "
++                f"stuck_neg={len(self._rf_stuck_neg)} "
++                f"stuck_forever={len(self._rf_stuck_final)} "
++                f"resid={sum(1 for c in self.stored_requests.values() if c != 0)} "
++                f"resid_neg={sum(1 for c in self.stored_requests.values() if c < 0)} "
++                f"zero_with_live={self._rf_zero_with_live} "
++                f"would_skip_save={self._rf_would_skip}"
++            )
++
+     def add_stored_request(self, req_id: str):
+         with self.done_task_lock:
+             self.stored_requests[req_id] += 1
+@@ -534,9 +663,34 @@
+         with self.done_task_lock:
+             if req_id in self.stored_requests:
+                 self.stored_requests[req_id] -= 1
++                if self.stored_requests[req_id] < 0:
++                    self._rf_underflow += 1
++                    logger.error("REF underflow req=%s counter=%d total=%d",
++                                 req_id, self.stored_requests[req_id],
++                                 self._rf_underflow)
+ 
+     def delete_finished_stored_request(self, req_id: str):
+         with self.done_task_lock:
++            pending = self._rf_live.pop(req_id, set())
++            if pending:
++                # A job already past the gate did its accounting legitimately; only
++                # one still waiting in the queue can come back as a stale job after
++                # the request resumes.
++                queued = pending - self._rf_running
++                self._rf_retire_pending += 1
++                self._rf_retire_running += len(pending & self._rf_running)
++                self._rf_retire_queued += len(queued)
++                self._rf_retired_seqs |= pending
++                if queued:
++                    self._rf_orphans[req_id] = (
++                        self._rf_orphans.get(req_id, 0) + len(queued)
++                    )
++                    self._rf_orphan_seqs |= queued
++                logger.error(
++                    "REF retire-with-pending req=%s running=%d queued=%d qsize=%d "
++                    "total=%d",
++                    req_id, len(pending & self._rf_running), len(queued),
++                    self.request_queue.qsize(), self._rf_retire_pending)
+             if req_id in self.stored_requests:
+                 del self.stored_requests[req_id]
+             self._skip_store_requests.discard(req_id)
+@@ -769,7 +923,10 @@
+         req_id = req_meta.req_id
+         current_event = req_meta.current_event
+ 
++        self._rf_job_ran(req_meta)
++
+         if req_id not in self.stored_requests:
++            self._rf_discard(req_meta)
+             self.record_save_completed(req_meta)
+             self.request_queue.task_done()
+             return
+@@ -777,6 +934,8 @@
+         # Report completion in `finally` so the scheduler releases this job's GPU
+         # block references even when the store path raises.
+         try:
++            if _ABA_DELAY:
++                time.sleep(_ABA_DELAY)
+             if self._should_skip_request(req_id):
+                 logger.debug(
+                     "Skipping Mooncake store for request %s while CPU/disk "
+@@ -1007,6 +1166,7 @@
+             if self.enable_kv_event and stored_events:
+                 self.update_kv_event(stored_events)
+         finally:
++            self._rf_discard(req_meta)
+             self.dec_stored_request(req_id)
+             self.record_save_completed(req_meta)
+             self.request_queue.task_done()
+@@ -1699,6 +1859,11 @@
+ 
+         if self.kv_role in ["kv_producer", "kv_both"]:
+             self._close_ended_store_requests(finished_req_ids, meta)
++            assert self.kv_send_thread is not None
++            self.kv_send_thread.scan_stuck(self.finished_store_req)
++            self._rf_steps = getattr(self, "_rf_steps", 0) + 1
++            if self._rf_steps % 100 == 0:
++                logger.error("%s", self.kv_send_thread.ref_summary())
+ 
+         # Blocks read by a store job are released by the scheduler when the job
+         # reports back (see build_connector_worker_meta), so no request ever waits
