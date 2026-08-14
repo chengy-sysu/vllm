@@ -513,7 +513,7 @@ def test_store_sending_thread_delta_saves_only_new_full_attention_chunks():
             block_ids=([0, 1, 2, 3],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_is_exist.call_args.args[0]
@@ -539,7 +539,7 @@ def test_store_sending_thread_delta_strides_with_local_phase():
             block_ids=([0, 1, 2, 3],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_is_exist.call_args.args[0]
@@ -565,7 +565,7 @@ def test_tp_sharded_group_saves_every_block_on_every_rank():
             block_ids=([0, 1, 2, 3],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_is_exist.call_args.args[0]
@@ -591,7 +591,7 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
             block_ids=([0],),
             block_hashes=[b"a0"],
             can_save=True,
-        )
+        ),
     )
 
     store.batch_is_exist.assert_not_called()
@@ -610,7 +610,7 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
             block_ids=([0, 1, 2, 3],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_is_exist.call_args.args[0]
@@ -750,7 +750,7 @@ def test_store_sending_thread_delta_start_rank_saves_second_local_chunk():
             block_ids=([0, 1, 2, 3],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_is_exist.call_args.args[0]
@@ -803,7 +803,7 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
             block_ids=([0, 1, 2, 3], [0, 1, 2, 3]),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_is_exist.call_args.args[0]
@@ -857,7 +857,7 @@ def test_store_sending_thread_prepares_missing_chunks_once_per_group():
             block_ids=([0, 1, 2], [2, 1, 0]),
             block_hashes=[b"a0", b"a1", b"a2"],
             can_save=True,
-        )
+        ),
     )
 
     db0.prepare_value.assert_not_called()
@@ -898,7 +898,7 @@ def test_store_sending_thread_only_skips_on_no_available_handle():
 
 def test_store_sending_thread_releases_pin_on_batch_is_exist_failure():
     # `batch_is_exist` raising must still retire the job from `stored_requests`
-    # so the scheduler can drop `delay_free_blocks` and release the pinned blocks.
+    # so the job is reported back and the scheduler drops its block references.
     store = MagicMock()
     store.batch_is_exist.side_effect = RuntimeError("mooncake down")
     thread = _make_store_sending_thread(store)
@@ -1865,7 +1865,7 @@ def test_store_sending_thread_clamps_token_len_to_lcm():
             block_ids=([0, 1, 2],),
             block_hashes=[b"a0", b"a1", b"a2"],
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_put_from_multi_buffers.call_args.args[0]
@@ -1904,7 +1904,7 @@ def test_store_sending_thread_skips_when_token_len_below_lcm():
             block_ids=([0, 1],),
             block_hashes=[b"a0", b"a1"],
             can_save=True,
-        )
+        ),
     )
 
     store.batch_is_exist.assert_not_called()
@@ -1981,7 +1981,7 @@ def test_store_sending_thread_only_stores_swa_blocks_in_window():
             block_ids=([0, 1], list(range(8))),
             block_hashes=hs,
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_put_from_multi_buffers.call_args.args[0]
@@ -2057,7 +2057,7 @@ def test_store_sending_thread_delta_saves_only_new_swa_boundary_chunks():
             block_ids=([0, 1], list(range(8))),
             block_hashes=hs,
             can_save=True,
-        )
+        ),
     )
 
     keys = store.batch_put_from_multi_buffers.call_args.args[0]
@@ -2128,7 +2128,7 @@ def test_store_sending_thread_kv_events_use_group_chunk_metadata():
             block_hashes=hs,
             can_save=True,
             token_ids=list(range(32)),
-        )
+        ),
     )
 
     full_event, swa_event = thread.get_kv_events()

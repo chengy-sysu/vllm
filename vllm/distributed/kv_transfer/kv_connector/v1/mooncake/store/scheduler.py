@@ -433,12 +433,15 @@ class MooncakeStoreScheduler:
             req_meta.save_seq = save_seq = self._next_save_seq
             self._next_save_seq += 1
             # Every allocated block is referenced, not just the ones covering
-            # this job's token range. A rank resumes from its own last
+            # this job's token range: a rank resumes from its own last
             # successful offset, which lags the scheduler's whenever a save was
-            # skipped or failed, so it may read anywhere below the range; and a
-            # partial-tail offload reads the block holding the tokens just past
-            # it, so it may read one block above.
+            # skipped or failed, so it may read anywhere below the range.
             block_ids = [bid for group in req_meta.block_ids for bid in group]
+            if req_meta.partial_tail_offloads:
+                # A partial-tail CoW block is deliberately kept out of the
+                # request's block table, so it is absent from `block_ids` even
+                # though the worker DMAs out of it just as asynchronously.
+                block_ids += [bid for _, bid, _ in req_meta.partial_tail_offloads]
             if not block_ids:
                 continue
             self._pinned_saves[save_seq] = (block_ids, self._num_workers)
@@ -474,6 +477,16 @@ class MooncakeStoreScheduler:
     ) -> tuple[bool, dict[str, Any] | None]:
         """Never delays the free: in-flight saves hold their own block refs."""
         return False, None
+
+    def has_pending_push_work(self) -> bool:
+        """Keep the engine stepping while any store job still holds block refs.
+
+        Completions only reach the scheduler as worker metadata on a step, so an
+        engine that quiesced with jobs in flight would leave those references
+        held indefinitely. Nothing else keeps it alive now that a finishing
+        request no longer defers its own free.
+        """
+        return bool(self._pinned_saves)
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
+    MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
 )
@@ -800,3 +801,96 @@ def test_resumed_partial_tail_attached_to_save_keeps_handoff_boundary():
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.num_saved_tokens == 48
     assert tracker.has_pending_offload is True
+
+
+def test_partial_tail_cow_block_is_referenced_for_the_job():
+    # The CoW block a partial-tail offload reads is deliberately kept out of the
+    # request block table, so it is absent from ReqMeta.block_ids. The worker
+    # DMAs out of it just as asynchronously, so it needs its own reference.
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    request = SimpleNamespace(
+        all_token_ids=list(range(12)),
+        block_hashes=[b"h0", b"h1", b"h2"],
+        num_output_placeholders=0,
+        num_prompt_tokens=12,
+    )
+    scheduler._unfinished_requests["req-0"] = (request, ([0],))
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=12,
+        allocated_block_ids=([0],),
+        num_saved_tokens=0,
+        token_ids=list(range(12)),
+        prefill_end_tokens=12,
+    )
+    out = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            new_block_ids=[],
+            num_computed_tokens=[],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+        partial_tail_offloads={"req-0": [(1, 7, 12)]},
+    )
+    pool = scheduler._gpu_block_pool
+
+    meta = scheduler.build_connector_meta(out)
+
+    save_seq = meta.requests[0].save_seq
+    assert scheduler._pinned_saves[save_seq][0] == [0, 7]
+    assert pool.blocks[7].ref_cnt == 1
+
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={save_seq: 1}
+            )
+        )
+    )
+    assert pool.blocks[7].ref_cnt == 0
+
+
+def test_pending_push_work_tracks_outstanding_block_references():
+    # The engine only learns of a completed job from worker metadata attached to
+    # a step, so a quiesced engine would hold the references forever. Nothing
+    # else keeps it stepping now that a finishing request no longer defers its
+    # own free.
+    scheduler = _make_bare_scheduler()
+    scheduler._unfinished_requests["req-0"] = (
+        SimpleNamespace(
+            all_token_ids=list(range(48)),
+            block_hashes=[b"h0", b"h1", b"h2"],
+            num_output_placeholders=0,
+            num_prompt_tokens=48,
+        ),
+        ([0, 1],),
+    )
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=44,
+        allocated_block_ids=([0, 1],),
+        num_saved_tokens=32,
+        token_ids=list(range(44)),
+        prefill_end_tokens=48,
+    )
+    assert scheduler.has_pending_push_work() is False
+
+    meta = scheduler.build_connector_meta(
+        _make_scheduler_output(scheduled_spec_tokens=None)
+    )
+    save_seq = meta.requests[0].save_seq
+    assert scheduler.has_pending_push_work() is True
+
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={save_seq: 1}
+            )
+        )
+    )
+    assert scheduler.has_pending_push_work() is False

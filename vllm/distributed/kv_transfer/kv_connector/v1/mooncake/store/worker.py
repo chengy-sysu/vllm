@@ -507,7 +507,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.coord = coord
         self.kv_role = kv_role
         # req_id -> save_seqs of its store jobs that are still queued or running.
-        # Keying jobs by the scheduler's globally monotonic save_seq instead of
+        # Keying jobs by save_seq, which the scheduler hands out from a counter
+        # that never repeats for the engine's lifetime, instead of merely
         # counting them makes the ledger immune to request-id reuse across
         # preemption: a job left over from a retired generation is missing from
         # the set its resumed generation builds, so it can no longer retire that
