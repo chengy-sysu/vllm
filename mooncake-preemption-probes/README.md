@@ -27,8 +27,8 @@ load/       preemption-forcing server + synthetic load
 |---|---|---|
 | `fingerprint_on_main.patch` | `643c125fa` (unfixed) | KV fingerprints + a scheduler-side block-reallocation detector |
 | `fingerprint_on_fix.patch` | `926230bfb` (block-reference fix) | KV fingerprints only — under the fix a referenced block is never reallocated, so the scheduler-side detector is constant zero and was dropped |
-| `aba_refprobe_on_unfixed.patch` | `ec33f3d7f` (unfixed worker ledger) | The real `dict[str, int]` ledger is the subject, so a `save_seq` set is kept alongside it purely as the ground truth for staleness |
-| `aba_shadow_ledger_on_fixed.patch` | the `save_seq`-keyed ledger fix | Replays the old bare-counter semantics event by event as a shadow ledger that records but never decides, so one run reports both what the old scheme would have got wrong and whether the new one got anything wrong |
+| `aba_refprobe_on_unfixed.patch` | `ec33f3d7f` (unfixed worker ledger) | The real `dict[str, int]` ledger is the subject, so a `save_seq` set is kept alongside it purely as the ground truth for staleness, plus the race margin |
+| `aba_shadow_ledger_on_fix.patch` | `d82c2e4d6` (the `save_seq`-keyed ledger fix) | Replays the old bare-counter semantics event by event as a shadow ledger that records but never decides, so one run reports both what the old scheme would have got wrong and whether the new one got anything wrong, plus the race margin |
 
 ### Fingerprints
 
@@ -47,16 +47,24 @@ interleave on stdout, which tears them.
 The scheduler-side `RACE` lines land in the **server log**, not in
 `/tmp/det_*.log`, so both have to be fed to the analyser.
 
-### ABA ledgers
+### ABA ledgers and the race margin
 
-`MC_ABA_HOLD` (seconds) and `MC_ABA_HOLD_MAX` (count) hold back only the jobs
-left over from a retired generation, and poll until that request id reappears in
-the ledger — i.e. until its resumed generation has registered, which is exactly
-the state the old gate misreads. Without this the window is missed: leftover jobs
-drain in milliseconds while a preempted request takes seconds to be rescheduled.
+A job left over from a retired generation only charges a live generation's
+bookkeeping if it reaches the gate *after* its request has resumed and
+re-registered under the same id. Both instants happen on their own, so the probes
+time them rather than force them: `MARGIN fired` is a job that gated after the
+resumption, which is the bug happening, and `MARGIN missed` carries the `miss_ms`
+of headroom the job had left. Nothing in the probes delays anything.
 
-A uniform delay on every job does not open the window, since it does not change
-the relative order of the two.
+That turns a rare boolean into a distribution. In a run with no firings the
+number that matters is `min(miss_ms)`: how much slower a PUT would have to be for
+the window to close.
+
+To close it without injecting timing, make a PUT legitimately slow instead —
+`QUOTA_BYTES` small enough that the master evicts and offloads to disk on the
+write path, more concurrency, larger saves. That is a configuration real
+deployments run, so the result says something about them rather than about an
+injected sleep.
 
 ## Running an arm
 
@@ -80,8 +88,9 @@ Everything site-specific is an environment variable: `VENV` (default
 `$HOME/.venv`), `MODEL` (`Qwen/Qwen3-32B-FP8`), `FSROOT_BASE`
 (`$HOME/mooncake_fs_ab`), `MOONCAKE_CONFIG_PATH` (`$HOME/mooncake_config.json`),
 `VLLM_REPO` (`$HOME/vllm`, only used to print which commit is under test),
-`LOGDIR`, `BASE` (`http://127.0.0.1:8000`) and `IFACE`, which is the interface
-`VLLM_HOST_IP` is taken from and is left unset by default.
+`LOGDIR`, `BASE` (`http://127.0.0.1:8000`), `QUOTA_BYTES` (2 TiB) and `IFACE`,
+which is the interface `VLLM_HOST_IP` is taken from and is left unset by
+default.
 
 `SERVE_EXTRA=--no-enable-flashinfer-autotune` is required, or
 `compile_or_warm_up_model` fails with
@@ -92,6 +101,7 @@ Everything site-specific is an environment variable: `VENV` (default
 ```bash
 python analysis/analyze_evi.py /tmp/det_*.log server.log   # totals
 python analysis/bad_dist.py    /tmp/det_*.log server.log   # bad keys per save_seq
+python analysis/aba_margin.py  server.log                  # race margin distribution
 ```
 
 `analyze_evi.py` reports keys fingerprinted, read-backs checked, mismatches,
@@ -101,3 +111,7 @@ which is what shows the two independent signals agreeing.
 
 Both need the server log as well as `/tmp/det_*.log`, otherwise the flagged-job
 count reads zero.
+
+`aba_margin.py` reports how many leftover jobs fired, how many missed and by how
+little, and echoes the `REF SUMMARY` / `SHADOW SUMMARY` lines. It only reads the
+server log.

@@ -1,23 +1,11 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 51c95ec01..8900f22ca 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
-@@ -84,6 +84,12 @@
- DEFAULT_TENANT_ID = "default"
- 
- MOONCAKE_NO_AVAILABLE_HANDLE = -200
-+
-+# REF probe: seconds to stall every store job, used to widen the ABA window on
-+# purpose. A queued job only becomes a dangerous orphan if it is still waiting
-+# when its preempted request resumes and registers a new save, and a real PUT is
-+# far too quick for that to happen on its own.
-+_ABA_DELAY = float(os.environ.get("MC_ABA_DELAY") or 0)
- _T = TypeVar("_T")
- 
- 
-@@ -525,7 +531,130 @@
-         # Per-request high-water mark of tokens actually persisted; the next
+@@ -526,6 +526,173 @@ class KVCacheStoreSendingThread(KVTransferThread):
          # batch resumes here, so pressure-skipped or failed ranges are retried.
          self._saved_offset: dict[str, int] = {}
-+
+ 
 +        # --- REF probe (issue #51637, baseline arm) ---------------------------
 +        # `stored_requests` here is the bare counter under test. Keep a separate
 +        # save_seq-keyed ledger as ground truth for which generation a job
@@ -42,9 +30,49 @@
 +        self._rf_stuck_neg: set[str] = set()
 +        self._rf_stuck_final: set[str] = set()
 +
++        # --- ABA margin probe -------------------------------------------------
++        # A leftover job from a retired generation can only charge the counter of
++        # a live generation if it reaches the gate *after* its request has resumed
++        # and re-registered. Both instants happen on their own, so timing them
++        # measures the window instead of forcing it open: a job that gates after
++        # the resumption is the bug firing, and one that gates before it reports
++        # how much headroom was left. Nothing here delays anything.
++        self._mg_retired_at: dict[int, float] = {}
++        self._mg_regen_at: dict[str, float] = {}
++        self._mg_await: dict[str, list[tuple[int, float]]] = {}
++        self._mg_fired = 0
++        self._mg_missed: list[float] = []
++
++    def _mg_register(self, req_id: str) -> None:
++        """Stamp a registration and close out the jobs that beat it. Lock held."""
++        now = time.monotonic()
++        self._mg_regen_at[req_id] = now
++        for save_seq, gate_at in self._mg_await.pop(req_id, []):
++            miss_ms = (now - gate_at) * 1e3
++            self._mg_missed.append(miss_ms)
++            logger.error(
++                "MARGIN missed req=%s seq=%s miss_ms=%.1f total=%d",
++                req_id, save_seq, miss_ms, len(self._mg_missed))
++
++    def _mg_gate(self, req_id: str, save_seq: int) -> None:
++        """Time a leftover job against its request's resumption. Lock held."""
++        now = time.monotonic()
++        retired_at = self._mg_retired_at.get(save_seq)
++        regen_at = self._mg_regen_at.get(req_id)
++        if retired_at is not None and regen_at is not None and regen_at > retired_at:
++            self._mg_fired += 1
++            logger.error(
++                "MARGIN fired req=%s seq=%s margin_ms=%.1f queued_ms=%.1f total=%d",
++                req_id, save_seq, (now - regen_at) * 1e3,
++                (now - retired_at) * 1e3, self._mg_fired)
++            return
++        # Gated first; the miss distance is only known once the request resumes.
++        self._mg_await.setdefault(req_id, []).append((save_seq, now))
++
 +    def add_request(self, request: ReqMeta) -> None:
 +        assert request.save_seq is not None
 +        with self.done_task_lock:
++            self._mg_register(request.req_id)
 +            if request.req_id not in self._rf_live:
 +                orphans = self._rf_orphans.get(request.req_id, 0)
 +                if orphans:
@@ -56,7 +84,7 @@
 +            self._rf_ever.add(request.req_id)
 +            self._rf_live.setdefault(request.req_id, set()).add(request.save_seq)
 +        super().add_request(request)
- 
++
 +    def _rf_discard(self, req_meta: ReqMeta) -> None:
 +        with self.done_task_lock:
 +            self._rf_running.discard(req_meta.save_seq)
@@ -75,6 +103,7 @@
 +            gate_pass = req_id in self.stored_requests
 +            if req_meta.save_seq in self._rf_orphan_seqs:
 +                self._rf_orphan_ran += 1
++                self._mg_gate(req_id, req_meta.save_seq)
 +                logger.error(
 +                    "REF orphan-ran req=%s seq=%s stale=%s gate_pass=%s "
 +                    "counter=%s live=%s total=%d",
@@ -128,7 +157,6 @@
 +                f"retire_with_pending={self._rf_retire_pending} "
 +                f"retire_running={self._rf_retire_running} "
 +                f"retire_queued={self._rf_retire_queued} "
-+                f"delay={_ABA_DELAY} "
 +                f"retrack={self._rf_retrack} armed={self._rf_armed} "
 +                f"orphan_ran={self._rf_orphan_ran} "
 +                f"mischarge={self._rf_mischarge} "
@@ -138,13 +166,17 @@
 +                f"resid={sum(1 for c in self.stored_requests.values() if c != 0)} "
 +                f"resid_neg={sum(1 for c in self.stored_requests.values() if c < 0)} "
 +                f"zero_with_live={self._rf_zero_with_live} "
-+                f"would_skip_save={self._rf_would_skip}"
++                f"would_skip_save={self._rf_would_skip} "
++                f"mg_fired={self._mg_fired} "
++                f"mg_missed={len(self._mg_missed)} "
++                f"mg_miss_min_ms={min(self._mg_missed, default=-1.0):.1f} "
++                f"mg_no_resume={sum(len(v) for v in self._mg_await.values())}"
 +            )
 +
      def add_stored_request(self, req_id: str):
          with self.done_task_lock:
              self.stored_requests[req_id] += 1
-@@ -534,9 +663,34 @@
+@@ -534,9 +701,34 @@ class KVCacheStoreSendingThread(KVTransferThread):
          with self.done_task_lock:
              if req_id in self.stored_requests:
                  self.stored_requests[req_id] -= 1
@@ -179,7 +211,7 @@
              if req_id in self.stored_requests:
                  del self.stored_requests[req_id]
              self._skip_store_requests.discard(req_id)
-@@ -769,7 +923,10 @@
+@@ -769,7 +961,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
          req_id = req_meta.req_id
          current_event = req_meta.current_event
  
@@ -190,16 +222,7 @@
              self.record_save_completed(req_meta)
              self.request_queue.task_done()
              return
-@@ -777,6 +934,8 @@
-         # Report completion in `finally` so the scheduler releases this job's GPU
-         # block references even when the store path raises.
-         try:
-+            if _ABA_DELAY:
-+                time.sleep(_ABA_DELAY)
-             if self._should_skip_request(req_id):
-                 logger.debug(
-                     "Skipping Mooncake store for request %s while CPU/disk "
-@@ -1007,6 +1166,7 @@
+@@ -1007,6 +1202,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
              if self.enable_kv_event and stored_events:
                  self.update_kv_event(stored_events)
          finally:
@@ -207,7 +230,7 @@
              self.dec_stored_request(req_id)
              self.record_save_completed(req_meta)
              self.request_queue.task_done()
-@@ -1699,6 +1859,11 @@
+@@ -1699,6 +1895,11 @@ class MooncakeStoreWorker:
  
          if self.kv_role in ["kv_producer", "kv_both"]:
              self._close_ended_store_requests(finished_req_ids, meta)

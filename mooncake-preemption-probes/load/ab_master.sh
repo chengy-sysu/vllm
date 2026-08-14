@@ -19,6 +19,6 @@ exec mooncake_master \
   --offload_force_evict=true \
   --offloading_queue_limit=500000 \
   --offload_cap_ratio=1.0 \
-  --quota_bytes=2199023255552 \
+  --quota_bytes=${QUOTA_BYTES:-2199023255552} \
   --eviction_high_watermark_ratio=0.90 \
   --enable_metric_reporting=false
